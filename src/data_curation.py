@@ -2,6 +2,7 @@
 import os
 import pandas as pd
 import datetime
+from models import get_engine 
 
 #%%
 class TickerNotFoundOnIngestedDataException(Exception):
@@ -22,38 +23,55 @@ def get_files_from_layer(layer_path: str, ticker: str) -> list[str]:
 
 
 def curate_data_by_ticker(ingestion_path: str, ticker: str, curation_path: str) -> bool:
-    
-    # get data from curated layer
-    # upsert with data from raw layer
-    # save to curated layer
-    
-    curated_data_paths = get_files_from_layer(layer_path="curated_data", ticker=ticker)
+        
+    curated_data_paths = get_files_from_layer(layer_path=curation_path, ticker=ticker)
     if curated_data_paths:
-        current_df = pd.read_csv(curated_data_paths[-1], index_col=0)
+        curated_df = pd.read_csv(curated_data_paths[-1], index_col=0)
     else:
-        current_df = pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits'])
-    print(current_df.shape)
+        curated_df = pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits'])
 
-    ingested_data_paths = get_files_from_layer(layer_path="ingested_data", ticker=ticker)
-    print(ingested_data_paths)
-
+    ingested_data_paths = get_files_from_layer(layer_path=ingestion_path, ticker=ticker)
     if ingested_data_paths:
         for path in ingested_data_paths:
                 df_aux = pd.read_csv(path)
-                current_df = df_aux.set_index(['Date'])\
-                                   .combine_first(current_df.set_index(['Date']))\
-                                   .reset_index()
-                print(f"{df_aux.shape} {current_df.shape}")
-        BASE_DIR = os.getcwd()
-        curation_path = f"{BASE_DIR}/{curation_path}/{ticker}/{datetime.datetime.now()}.csv"
-        current_df.to_csv(curation_path)
-    # else:
-    #     raise TickerNotFoundOnIngestedDataException(ticker)
+                curated_df = df_aux.set_index(['Date'])\
+                                   .combine_first(curated_df.set_index(['Date']))\
+                                   .reset_index()        
+    else:
+        raise TickerNotFoundOnIngestedDataException(ticker)
+
+    return curated_df
+
+
+def save_curated_data(curation_path: str, ticker: str, curated_data: pd.DataFrame, output_format: str):
+    BASE_DIR = os.getcwd()
+    curation_path = f"{BASE_DIR}/{curation_path}/{ticker}"
+    curation_name = f"{datetime.datetime.now()}"
+    if not os.path.exists(curation_path): 
+        os.mkdir(curation_path) 
+    if output_format == 'csv':
+        curated_data.to_csv(f"{curation_path}/{curation_name}.csv")
+    if output_format == 'sqlite':
+        database_url = f"sqlite:////{curation_path}/{curation_name}.db"
+        engine = get_engine(database_url)
+        curated_data.to_sql(f"{curation_path}/{curation_name}",
+                            con=engine,
+                            if_exists='replace')
+
+
+def curate_data_all_tickers(ingestion_path: str, curation_path: str, output_format: str) -> bool:
+    tickers_in_layer = os.listdir(ingestion_path)
+    for ticker in tickers_in_layer:
+        curated_df = curate_data_by_ticker(ingestion_path=ingestion_path, ticker=ticker, curation_path=curation_path)
+        save_curated_data(curation_path=curation_path, ticker=ticker, curated_data=curated_df, output_format=output_format)
+
+    
 
 
 if __name__=="__main__":
     print('\n')
-    curate_data_by_ticker(ingestion_path="ingested_data", ticker="sopa", curation_path="curated_data")
+    # curate_data_by_ticker(ingestion_path="ingested_data", ticker="sopa", curation_path="curated_data")
+    curate_data_all_tickers(ingestion_path="ingested_data", curation_path="curated_data", output_format='sqlite')
 
 #%%
 
