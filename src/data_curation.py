@@ -22,11 +22,22 @@ def get_files_from_layer(layer_path: str, ticker: str) -> list[str]:
     return tickers_full_paths
 
 
+def read_datafile(path):
+    if path.split('.')[-1] == 'csv':
+        return pd.read_csv(path, index_col=0)
+    elif path.split('.')[-1] == 'db':
+        database_url  = f"sqlite:///{path}"
+        table_name = path[:-3]
+        engine = get_engine(database_url)
+        return pd.read_sql_table(table_name, engine)
+
+
 def curate_data_by_ticker(ingestion_path: str, ticker: str, curation_path: str) -> bool:
         
     curated_data_paths = get_files_from_layer(layer_path=curation_path, ticker=ticker)
     if curated_data_paths:
-        curated_df = pd.read_csv(curated_data_paths[-1], index_col=0)
+        curated_df = read_datafile(curated_data_paths[-1])
+        # curated_df = pd.read_csv(curated_data_paths[-1], index_col=0)
     else:
         curated_df = pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits'])
 
