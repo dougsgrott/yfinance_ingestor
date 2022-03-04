@@ -67,6 +67,7 @@ def save_curated_data(curation_path: str, ticker: str, curated_data: pd.DataFram
         engine = get_engine(database_url)
         curated_data.to_sql(f"{curation_path}/{curation_name}",
                             con=engine,
+                            index=False,
                             if_exists='replace')
 
 
