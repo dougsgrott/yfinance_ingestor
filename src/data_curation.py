@@ -23,7 +23,7 @@ def get_files_from_layer(layer_path: str, ticker: str) -> list[str]:
     return tickers_full_paths
 
 
-def read_datafile(path_list, file_format) -> pd.DataFrame:
+def read_datafile(path_list, file_format, ticker) -> pd.DataFrame:
     curated_df = pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits'])
     if file_format == 'csv':
         filtered_paths = [path for path in path_list  if path.split('.')[-1] == 'csv']
@@ -37,15 +37,30 @@ def read_datafile(path_list, file_format) -> pd.DataFrame:
             table_name = filtered_paths[-1][:-3]
             engine = get_engine(database_url)
             curated_df = pd.read_sql_table(table_name, engine)
-    return curated_df
 
-        
+    elif file_format == 'postgres':
+        user = "root"
+        passwd = "root"
+        host = "localhost"
+        port = "5432"
+        db = "premise_postgres_db"
+        database_url = f"postgresql://{user}:{passwd}@{host}:{port}/{db}" 
+        engine = get_engine(database_url)
+        name = ticker
+        curated_df = pd.read_sql_table(name, engine)
+    
+    elif file_format == 'parquet':
+        filtered_paths = [path for path in path_list if "parquet" in path]
+        if len(filtered_paths) != 0:
+            curated_df = pd.read_parquet(filtered_paths[-1])
+
+    return curated_df
 
 
 def curate_data_by_ticker(ingestion_path: str, ticker: str, curation_path: str, file_format: str) -> bool:
         
     curated_data_paths = get_files_from_layer(layer_path=curation_path, ticker=ticker)
-    curated_df = read_datafile(curated_data_paths, file_format)
+    curated_df = read_datafile(curated_data_paths, file_format, ticker)
 
     ingested_data_paths = get_files_from_layer(layer_path=ingestion_path, ticker=ticker)
     if ingested_data_paths:
@@ -61,10 +76,11 @@ def curate_data_by_ticker(ingestion_path: str, ticker: str, curation_path: str, 
     return curated_df
 
 
-def save_curated_data(curation_path: str, ticker: str, curated_data: pd.DataFrame, file_format: str):
+def save_curated_data(curation_path: str, ticker: str, curated_data: pd.DataFrame, file_format: str, use_datetime_on_output_name: bool):
     BASE_DIR = os.getcwd()
     curation_path = f"{BASE_DIR}/{curation_path}/{ticker}"
-    curation_name = f"{datetime.datetime.now()}"
+    curation_name = f"{datetime.datetime.now()}" if use_datetime_on_output_name else ticker
+    # curation_name = f"{datetime.datetime.now()}"
     if not os.path.exists(curation_path): 
         os.mkdir(curation_path) 
     if file_format == 'csv':
@@ -84,14 +100,17 @@ def save_curated_data(curation_path: str, ticker: str, curated_data: pd.DataFram
         engine = get_engine(database_url)
         name = ticker
         curated_data.to_sql(ticker, con=engine, index=False, if_exists='replace')
+    if file_format == 'parquet':
+        name = f"{curation_path}/{curation_name}"
+        curated_data.to_parquet(f'{name}.parquet.gzip', compression='gzip')
 
 
 
-def curate_data_all_tickers(ingestion_path: str, curation_path: str, file_format: str) -> bool:
+def curate_data_all_tickers(ingestion_path: str, curation_path: str, file_format: str, use_datetime_on_output_name: bool=False) -> bool:
     tickers_in_layer = os.listdir(ingestion_path)
     for ticker in tickers_in_layer:
         curated_df = curate_data_by_ticker(ingestion_path=ingestion_path, ticker=ticker, curation_path=curation_path, file_format=file_format)
-        save_curated_data(curation_path=curation_path, ticker=ticker, curated_data=curated_df, file_format=file_format)
+        save_curated_data(curation_path=curation_path, ticker=ticker, curated_data=curated_df, file_format=file_format, use_datetime_on_output_name=use_datetime_on_output_name)
 
     
 
@@ -99,11 +118,11 @@ def curate_data_all_tickers(ingestion_path: str, curation_path: str, file_format
 if __name__=="__main__":
     print('\n')
     # curate_data_by_ticker(ingestion_path="ingested_data", ticker="sopa", curation_path="curated_data")
-    curate_data_all_tickers(ingestion_path="ingested_data", curation_path="curated_data", file_format='csv')
-    # time.sleep(2)
-    # curate_data_all_tickers(ingestion_path="ingested_data", curation_path="curated_data", file_format='csv')
-    # time.sleep(2)
-    # curate_data_all_tickers(ingestion_path="ingested_data", curation_path="curated_data", file_format='sqlite')
-    # time.sleep(2)
+    curate_data_all_tickers(ingestion_path="ingested_data", curation_path="curated_data", file_format='parquet', use_datetime_on_output_name=False)
+    time.sleep(2)
+    curate_data_all_tickers(ingestion_path="ingested_data", curation_path="curated_data", file_format='csv', use_datetime_on_output_name=False)
+    time.sleep(2)
+    curate_data_all_tickers(ingestion_path="ingested_data", curation_path="curated_data", file_format='sqlite', use_datetime_on_output_name=False)
+    time.sleep(2)
     # curate_data_all_tickers(ingestion_path="ingested_data", curation_path="curated_data", file_format='sqlite')
     # time.sleep(2)
