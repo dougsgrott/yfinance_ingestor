@@ -8,11 +8,14 @@ import json
 import yfinance as yf
 import pandas as pd
  
-from writers import DataWriter
+from writers import DataWriter, S3Writer
  
 import logging
 import sys
- 
+
+from dotenv import load_dotenv
+import boto3 
+
 logger = logging.getLogger(__name__)
 logging.basicConfig(
     level=logging.INFO,
@@ -26,9 +29,10 @@ logging.basicConfig(
 
 class DataIngestor(ABC):
 
-    def __init__(self, writer, ticker: List, interval: str, period: str=None, start: datetime=None, end: datetime=None, prepost: bool=False, auto_adjust: bool=True, actions: bool=True, default_start_time: datetime=datetime.date(1800, 1, 1)) -> None:
+    def __init__(self, writer, ticker: list, batch_ingest: bool, interval: str, period: str=None, ticker_group: str="Undefined", start: datetime=None, end: datetime=None, prepost: bool=False, auto_adjust: bool=True, actions: bool=True, default_start_time: datetime=datetime.date(1800, 1, 1)) -> None:
         self.default_start_date = None
         self.ticker = ticker
+        self.ticker_group = ticker_group
         self.period = period
         self.interval = interval
         self.start = start
@@ -37,6 +41,7 @@ class DataIngestor(ABC):
         self.auto_adjust = auto_adjust
         self.actions = actions
         self.writer = writer
+        self.batch_ingest = batch_ingest
         self._checkpoint = self._load_checkpoint()
  
     @property
@@ -71,11 +76,11 @@ class DataIngestor(ABC):
         outer_join_dict = {tick: None for tick in outer_join_keys}
         new_checkpoint = {**checkpoint, **outer_join_dict}
         return new_checkpoint
- 
+
     def _update_checkpoint(self, key, value) -> None:
         self._checkpoint[str(key)] = value
         self._write_checkpoint()
- 
+
     def _verify_ingestion_conditions(self, key) -> bool:
         ingestion_flag = True
         checkpoint_date = self._checkpoint[str(key)]
@@ -84,89 +89,93 @@ class DataIngestor(ABC):
             checkpoint_date = datetime.datetime.strptime(checkpoint_date, "%Y-%m-%d").date()
             if current_date < checkpoint_date:
                 ingestion_flag = False
- 
+
         return ingestion_flag
 
     @abstractmethod
     def ingest(self) -> None:
         pass
- 
+
+
 class TickerDataIngestor(DataIngestor):
- 
+
+    def get_data(self, api, ticker, latest_date, current_date):
+        try:
+            if latest_date is None:
+                data_df = self.get_entire_history_data(api, ticker)
+            elif latest_date <= current_date:
+                latest_date = datetime.datetime.strptime(latest_date, "%Y-%m-%d").date()
+                data_df = self.get_data_starting_from_date(api, latest_date, ticker)
+            logger.info(f"Ingesting ticker={ticker}. Num of entries={data_df.shape[0]}, Latest date={latest_date}, Current date={current_date}")
+            time.sleep(3)
+        except Exception as e:
+            print(e)
+            data_df = pd.DataFrame(columns=['Date', 'Open', 'High', 'Low', 'Close', 'Volume', 'Dividends', 'Stock Splits', "Ticker"])
+            logger.info(f"An exception occured while ingesting '{ticker}': {e}")
+        
+        return data_df
+
     def ingest(self) -> None:
+        batched_data, batched_checkpoint_keys_values = [], []
         for ticker in self.ticker:
-            ingestion_conditions = self._verify_ingestion_conditions(ticker)
-            if ingestion_conditions:
+            ingestion_flag = self._verify_ingestion_conditions(ticker)
+            if ingestion_flag:
                 api = yf.Ticker(ticker)
                 latest_date = self._checkpoint[ticker]
                 current_date = datetime.date.today().strftime("%Y-%m-%d")
-                
-                if latest_date is None:
-                    data_df = self.ingest_history(api, ticker)
-                elif latest_date <= current_date:
-                    latest_date = datetime.datetime.strptime(latest_date, "%Y-%m-%d").date()
-                    data_df = self.ingest_from_date(api, latest_date, ticker)
+                data_df = self.get_data(api, ticker, latest_date, current_date)
 
-                self.writer(ticker=ticker).write(data_df)
-                checkpoint_value = current_date
-                self._update_checkpoint(ticker, checkpoint_value)
-                logger.info(f"Ingestion progress: Ticker={ticker}, Num of entries={data_df.shape[0]}, Used date={latest_date}, Value={checkpoint_value}, Ingested={ingestion_conditions}")
-                time.sleep(3)
- 
-
-    def batch_ingest(self) -> None:
-        batched_data, batched_checkpoint_keys, batched_checkpoint_values, batched_flag = [], [], [], []
-        for ticker in self.ticker:
-            ingestion_conditions = self._verify_ingestion_conditions(ticker)
-            batched_flag.append(ingestion_conditions)
-            if ingestion_conditions:
-                try:
-                    api = yf.Ticker(ticker)
-                    latest_date = self._checkpoint[ticker]
-                    current_date = datetime.date.today().strftime("%Y-%m-%d")
-
-                    if latest_date is None:
-                        data_df = self.ingest_history(api, ticker)
-                    elif latest_date <= current_date:
-                        latest_date = datetime.datetime.strptime(latest_date, "%Y-%m-%d").date()
-                        data_df = self.ingest_from_date(api, latest_date, ticker)
-
-                    checkpoint_value = current_date
+                if self.batch_ingest is not True:
+                    self._update_checkpoint(ticker, current_date)
+                    self.writer.write(data_df, ticker, self.ticker_group)
+                else:
                     batched_data.append(data_df)
-                    batched_checkpoint_keys.append(ticker)
-                    batched_checkpoint_values.append(checkpoint_value)
-                    time.sleep(3)
-                except Exception as e:
-                    print(e)
-            logger.info(f"Batch ingestion progress: Ticker={ticker}, Num of entries={data_df.shape[0]}, Used date={latest_date}, Value={checkpoint_value}, Ingested={ingestion_conditions}")
+                    batched_checkpoint_keys_values.append((ticker, current_date))
+            else:
+                logger.info(f"The ingestion conditions for ticker '{ticker}' were not fulfilled.")
 
-        if len(batched_data) > 0:
-            self.writer(ticker="batch").batch_write(batched_data)
-            for k, v, flag in zip(batched_checkpoint_keys, batched_checkpoint_values, batched_flag):
+        if self.batch_ingest:
+            self.writer.batch_write(batched_data, "batch", self.ticker_group)
+            for k, v in batched_checkpoint_keys_values:
                 self._update_checkpoint(k, v)
 
-    def ingest_from_date(self, api, start, ticker) -> pd.DataFrame:
+    def get_data_starting_from_date(self, api, start, ticker) -> pd.DataFrame:
         data_df = api.history(start=start, interval=self.interval, prepost=self.prepost, actions=self.actions, auto_adjust=self.auto_adjust)
         data_df['Ticker'] = ticker.upper()
         return data_df
- 
-    def ingest_history(self, api, ticker) -> pd.DataFrame:
+
+    def get_entire_history_data(self, api, ticker) -> pd.DataFrame:
         data_df = api.history(period="max", interval=self.interval, prepost=self.prepost, actions=self.actions, auto_adjust=self.auto_adjust)
         data_df['Ticker'] = ticker.upper()
         return data_df
- 
- 
-if __name__=="__main__": 
- 
-    # my_ticker = ["aapl", "sopa"]
-    # my_ticker = ["WEGE3.SA"] #, "MGLU3.SA"
-    my_ticker = ["MGLU3.SA"]
- 
-    ticker_ingestor = TickerDataIngestor( 
-        writer=DataWriter, 
-        ticker=my_ticker, 
+
+
+if __name__=="__main__":
+
+    load_dotenv('/home/user/.env')
+    # AWS_ACCESS_KEY_ID = os.getenv('AWS_ACCESS_KEY_ID')
+    # AWS_SECRET_ACCESS_KEY = os.getenv('AWS_SECRET_ACCESS_KEY')
+    s3_client = boto3.client(
+        's3',
+        aws_access_key_id=os.getenv('AWS_ACCESS_KEY_ID'),
+        aws_secret_access_key=os.getenv('AWS_SECRET_ACCESS_KEY'))
+    bucket_prefix = "dms"
+    
+    writer = S3Writer(client=s3_client, bucket_prefix=bucket_prefix)
+    
+    # writer = DataWriter()
+
+    my_ticker = ["AAPL"] #, "GOOG"
+    # my_ticker = ["MGLU3.SA", "WEGE3.SA"]
+    ticker_group = "NASDAQ" # ticker_prefix
+
+    ticker_ingestor = TickerDataIngestor(
+        writer=writer,
+        ticker=my_ticker,
+        ticker_group=ticker_group,
         interval="1d",
-    ) 
- 
-    # ticker_ingestor.ingest()
-    ticker_ingestor.batch_ingest()
+        batch_ingest=False,
+    )
+
+    ticker_ingestor.ingest()
+    
