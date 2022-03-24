@@ -1,11 +1,13 @@
+from abc import ABC, abstractmethod
 import datetime
 import os
 import pandas as pd
 import logging
-from botocore.exceptions import ClientError
+from s3_base import S3BaseClass
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
 
 class DataTypeNotSupportedForIngestionException(Exception):
     def __init__(self, data):
@@ -14,22 +16,33 @@ class DataTypeNotSupportedForIngestionException(Exception):
         super().__init__(self.message)
 
 
-class DataWriter:
+#####################################################################
+# On-Premise File Writers
+#####################################################################
 
-    def __init__(self, ticker: str='', ticker_group: str='') -> None:
-        self.ticker = ticker
-        self.ticker_group = ticker_group
+class FileBaseClass(ABC):
+    def __init__(self, base_directory, ticker: str='', ticker_group: str='') -> None:
+        self.base_directory = base_directory
         self.filename = ''
+        self.filepath = ''
+        self.full_path = ''
+
+    @abstractmethod
+    def _write(self, data: pd.DataFrame):
+        pass
 
     def write(self, data: pd.DataFrame, ticker: str, ticker_group: str):
-        self.ticker = ticker
-        self.ticker_group = ticker_group
-        self.filename = f"ingested_data/{self.ticker_group}/{self.ticker}/{datetime.datetime.now()}.csv"
-        
-        os.makedirs(os.path.dirname(self.filename), exist_ok=True)
+        self.filepath = f"{self.base_directory}/{ticker_group}/{ticker}/"
+        self.filename = f"{datetime.datetime.now()}"
+        self.full_path = f"{self.base_directory}/{ticker_group}/{ticker}/{self.filename}"
+
+        os.makedirs(os.path.dirname(self.full_path), exist_ok=True)
         if isinstance(data, pd.DataFrame):
-            data.to_csv(self.filename)
-            logger.info(f"Wrote data for ticker {self.ticker}")
+            try:
+                self._write(data)
+                logger.info(f"Wrote data at {self.full_path}")
+            except Exception as e:
+                logger.info("Failed to write data due to exception '{e}'")
         else:
             raise DataTypeNotSupportedForIngestionException(data)
 
@@ -41,48 +54,61 @@ class DataWriter:
             self.write(batch_df, ticker, ticker_group)
 
 
-class S3Writer(DataWriter):
+class CsvWriter(FileBaseClass):
+    def _write(self, data: pd.DataFrame):
+        data.to_csv(f"{self.full_path}.csv")
 
-    def __init__(self, client, bucket_prefix: str, ticker: str='', ticker_group: str='') -> None:
-        super().__init__(ticker=ticker, ticker_group=ticker_group)
-        self.client = client
-        self.bucket_prefix = bucket_prefix
-        
-    @property
-    def bucket_name(self):
-        fmt_bucket_prefix = self.format_string(self.bucket_prefix)
-        fmt_ticker_group = self.format_string(self.ticker_group)
-        fmt_ticker = self.format_string(self.ticker)
-        return f"{fmt_bucket_prefix}-raw-{fmt_ticker_group}-{fmt_ticker}"
 
-    def format_string(self, in_string):
-        return in_string.lower().split('.')[0]
+class ParquetWriter(FileBaseClass):
+    def _write(self, data: pd.DataFrame):
+        data.to_parquet(f"{self.full_path}.parquet")
 
-    def create_s3_bucket(self):
-        """Create an S3 bucket in a specified region
-        :return: True if bucket created, else False
-        """
-        try:
-            self.client.create_bucket(Bucket=self.bucket_name)
-        except ClientError as e:
-            logging.error(e)
-            return False
-        return True
 
-    def upload_to_s3(self):
-        """Upload a file to an S3 bucket
-        :return: True if file was uploaded, else False
-        """
-        object_name = os.path.basename(self.filename)
-        try:
-            response = self.client.upload_file(self.filename, self.bucket_name, object_name)
-            logger.info(f"Object '{object_name}' was uploaded on bucket '{self.bucket_name}'")
-        except ClientError as e:
-            logging.error(e)
-            return False
-        return True
+#####################################################################
+# Cloud Object Writers
+#####################################################################
+
+class FileS3Writer(S3BaseClass):
+    
+    @abstractmethod
+    def _write(self, data):
+        pass
 
     def write(self, data: pd.DataFrame, ticker: str, ticker_group: str):
-        super().write(data, ticker, ticker_group)
+        filename = f"{datetime.datetime.now()}"
+        self.full_path = f"s3://{self.bucket_name}/{ticker_group}/{ticker}/{filename}"
         self.create_s3_bucket()
-        self.upload_to_s3()
+        self._write(data)
+
+    def batch_write(self, batch_data: list, ticker: str, ticker_group: str):
+        if isinstance(batch_data, list):
+            batch_df = pd.DataFrame()
+            for data in batch_data:
+                batch_df = pd.concat([batch_df, data], axis=0)
+            self.write(batch_df, ticker, ticker_group)
+
+class CsvS3Writer(FileS3Writer):
+    def _write(self, data):
+        data.to_csv(f"{self.full_path}.csv")
+
+
+class ParquetS3Writer(FileS3Writer):
+    def _write(self, data):
+        data.to_parquet(f"{self.full_path}.parquet")
+
+
+#####################################################################
+# On-Premise and Cloud Writer Hybrid
+#####################################################################
+
+class CsvS3Transfer(CsvWriter, S3BaseClass):
+
+    def __init__(self, client, bucket_name, base_directory) -> None:
+        self.csv_writer = CsvWriter(base_directory)
+        self.s3_base_class = S3BaseClass(client=client, bucket_name=bucket_name)
+
+    def write(self, data: pd.DataFrame, ticker: str, ticker_group: str):
+        self.csv_writer.write(data, ticker=ticker, ticker_group=ticker_group)
+        self.s3_base_class.create_s3_bucket()
+        full_path = f"{self.csv_writer.full_path}.csv"
+        self.s3_base_class.upload_to_s3(full_path=full_path, ticker=ticker, ticker_group=ticker_group)
